@@ -7,7 +7,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 import torch
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import pathlib
 from common_functions import (
@@ -43,6 +43,8 @@ supported_models = {
     "wc-33": SelfHostedModels.MODEL_WIZARDLM_WIZARD_CODER_33B,
     "sqlc-70-a": SelfHostedModels.MODEL_DEFOG_SQLCODER_70B,
     "sqlc-7-2": SelfHostedModels.MODEL_DEFOG_SQLCODER_7B_2,
+    "mistral-v2": SelfHostedModels.MODEL_MISTRALAI_MISTRAL_7B_V2,
+
 }
 
 model_tensor_types = {
@@ -53,6 +55,7 @@ model_tensor_types = {
     SelfHostedModels.MODEL_MISTRALAI_MISTRAL_7B: torch.bfloat16,
     SelfHostedModels.MODEL_MISTRALAI_MIXTRAL_8X7B: torch.bfloat16,
     SelfHostedModels.MODEL_WIZARDLM_WIZARD_CODER_33B: torch.bfloat16,
+    SelfHostedModels.MODEL_MISTRALAI_MISTRAL_7B_V2: torch.bfloat16,
 }
 
 
@@ -64,28 +67,14 @@ def initialize_model_and_tokenizer(
         model_name, cache_dir=SelfHosted.MODEL_WEIGHTS_DIRECTORY, token=auth_token
     )
 
-    if model_name in [
-        SelfHostedModels.MODEL_MISTRALAI_MISTRAL_7B,
-        SelfHostedModels.MODEL_MISTRALAI_MIXTRAL_8X7B,
-    ]:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            max_memory={0: "40GB", 1: "40GB", 2: "40GB", 3: "80GB"},
-            cache_dir=SelfHosted.MODEL_WEIGHTS_DIRECTORY,
-            token=auth_token,
-            torch_dtype=model_tensor_types[model_name],
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            max_memory={0: "40GB", 1: "40GB", 2: "40GB", 3: "80GB"},
-            cache_dir=SelfHosted.MODEL_WEIGHTS_DIRECTORY,
-            token=auth_token,
-            torch_dtype=model_tensor_types[model_name],
-            rope_scaling={"type": "dynamic", "factor": 2},
-        )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        max_memory={0: "40GB", 1: "40GB", 2: "40GB", 3: "80GB"},
+        cache_dir=SelfHosted.MODEL_WEIGHTS_DIRECTORY,
+        token=auth_token,
+        torch_dtype=model_tensor_types[model_name],
+    )
 
     return (tokenizer, model)
 
@@ -119,7 +108,7 @@ def run_queries_on_model(
     model: Any,
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
 ) -> None:
-    for context, question, hardness, db_id in total_user_query:
+    for context, question, hardness, db_id, evidence in total_user_query:
         torch.cuda.empty_cache()
         try:
             data_to_log = {
@@ -135,21 +124,21 @@ def run_queries_on_model(
                 instruction_size, shot_size, db_id
             )
             prompt = generate_model_specific_prompt_for_self_hosted_model(
-                model_name, system_prompt, context, question
+                model_name, system_prompt, context, question,evidence
             )
 
             data_to_log["request"] = prompt
             inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
             llm_prompt_tokens = len(inputs)
 
-            response_time_start = datetime.now()
+            response_time_start = datetime.now(timezone.utc)
             output = model.generate(
                 **inputs,
                 use_cache=True,
                 max_new_tokens=Defaults.MAX_TOKENS_TO_GENERATE,
                 pad_token_id=tokenizer.eos_token_id,
             )
-            response_time_stop = datetime.now()
+            response_time_stop = datetime.now(timezone.utc)
 
             llm_response_content = tokenizer.decode(output[0], skip_special_tokens=True)
             llm_response_tokens = len(output[0])
@@ -171,6 +160,8 @@ def run_queries_on_model(
                 )
                 continue
 
+            data_to_log["response_time_start"] = response_time_start.strftime('%Y-%m-%d %H:%M:%S')
+            data_to_log["response_time_stop"] = response_time_stop.strftime('%Y-%m-%d %H:%M:%S')
             data_to_log["is_sql"] = 1
             data_to_log["sql_response"] = sql_response
             log("SQL Response successful", data_to_log, log_file_path)
@@ -223,6 +214,43 @@ def run_inferences() -> None:
                 for dataset_length, query_list, gold_file_list in datasets_info:
                     model_file_path = f"{args.target_dir}/{HOST_ENV}/{file_shot_size}/{model_name}/{instruction_size}_Instructions/{dataset_length}_Inferences"
 
+                if os.path.exists(model_file_path) and os.path.isfile(f"{model_file_path}/execution-log.jsonl"):
+                    count = 0
+                    with open(f"{model_file_path}/execution-log.jsonl", 'r') as file:
+                        for _ in file:
+                            count += 1
+                    print(count)
+                    
+                    if count == dataset_length:
+                        continue
+                    else:
+                        log_file_path = f"{model_file_path}/execution-log.jsonl"
+                        output_file_path = f"{model_file_path}/predicted.txt"
+                        metrics_file_path = f"{model_file_path}/metrics.csv"
+                        print(f"Starting loop for {model_name} - {file_shot_size} prompt - {instruction_size} instructions - {dataset_length} inferences - resuming from {count}")
+                        loop_start_time = datetime.now()
+                        
+                        run_queries_on_model(
+                        query_list[count:],
+                        output_file_path,
+                        metrics_file_path,
+                        log_file_path,
+                        model_name,
+                        instruction_size,
+                        dataset_length,
+                        file_shot_size,
+                        model,
+                        tokenizer,
+                        )
+                        generate_gold_file(gold_file_list, model_file_path,dataset_length)
+                        loop_end_time = datetime.now()
+                        total_secs = (loop_end_time - loop_start_time).total_seconds()
+                        print(
+                            f"Time taken for {model_name} - {file_shot_size} prompt - {instruction_size} instructions - {dataset_length} inferences: {get_elapsed_time(total_secs)}"
+                        )
+
+
+                else:
                     output_file_path, metrics_file_path, log_file_path = (
                         initialize_files(model_file_path)
                     )
@@ -243,7 +271,7 @@ def run_inferences() -> None:
                         model,
                         tokenizer,
                     )
-                    generate_gold_file(gold_file_list, model_file_path)
+                    generate_gold_file(gold_file_list, model_file_path,dataset_length)
                     loop_end_time = datetime.now()
                     total_secs = (loop_end_time - loop_start_time).total_seconds()
                     print(

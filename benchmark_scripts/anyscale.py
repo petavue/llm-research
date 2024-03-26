@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import pathlib
 from openai import AsyncOpenAI
@@ -48,7 +48,7 @@ async def run_queries_on_anyscale(
     shot_size: str,
 ) -> None:
     try:
-        for context, question, hardness, db_id in total_user_query:
+        for context, question, hardness, db_id, evidence in total_user_query:
             data_to_log = {
                 "environment": HOST_ENV,
                 "model": model_name,
@@ -67,7 +67,7 @@ async def run_queries_on_anyscale(
                     "role": "system",
                     "content": system_prompt.replace("[context]", context).replace(
                         "[question]", ""
-                    ),
+                    ).replace("[hint]",str(evidence))
                 },
                 {
                     "role": "user",
@@ -75,12 +75,12 @@ async def run_queries_on_anyscale(
                 },
             ]
             data_to_log["request"] = req
-            response_time_start = datetime.now()
+            response_time_start = datetime.now(timezone.utc)
             anyscale_response = await client.chat.completions.create(
                 model=model_name,
                 messages=req,
             )
-            response_time_stop = datetime.now()
+            response_time_stop = datetime.now(timezone.utc)
             data_to_log["response"] = str(anyscale_response)
 
             llm_response_content = anyscale_response.choices[0].message.content
@@ -103,8 +103,12 @@ async def run_queries_on_anyscale(
                 )
                 continue
 
+
+            data_to_log["response_time_start"] = response_time_start.strftime('%Y-%m-%d %H:%M:%S')
+            data_to_log["response_time_stop"] = response_time_stop.strftime('%Y-%m-%d %H:%M:%S')
             data_to_log["is_sql"] = 1
             data_to_log["sql_response"] = sql_response
+            
             log("SQL Response successful", data_to_log, log_file_path)
 
             response_time = response_time_stop - response_time_start
@@ -144,31 +148,67 @@ async def multi_process(
         for dataset_length, query_list, gold_file_list in datasets_info:
             model_file_path = f"{target_dir}/{HOST_ENV}/{file_shot_size}/{model_name}/{instruction_size}_Instructions/{dataset_length}_Inferences"
 
-            output_file_path, metrics_file_path, log_file_path = initialize_files(
-                model_file_path
-            )
+            print(f"{model_file_path}/execution-log.jsonl")
+            if os.path.exists(model_file_path) and os.path.isfile(f"{model_file_path}/execution-log.jsonl"):
+                count = 0
+                with open(f"{model_file_path}/execution-log.jsonl", 'r') as file:
+                    for _ in file:
+                        count += 1
+                print(count)
+                
+                if count == dataset_length:
+                    continue
+                else:
+                    log_file_path = f"{model_file_path}/execution-log.jsonl"
 
-            print(
-                f"Starting loop for {model_name} - {file_shot_size} prompt - {instruction_size} instructions - {dataset_length} inferences"
-            )
-            loop_start_time = datetime.now()
-            await run_queries_on_anyscale(
-                query_list,
-                output_file_path,
-                metrics_file_path,
-                log_file_path,
-                model_name,
-                client,
-                instruction_size,
-                dataset_length,
-                file_shot_size,
-            )
-            generate_gold_file(gold_file_list, model_file_path)
-            loop_end_time = datetime.now()
-            total_secs = (loop_end_time - loop_start_time).total_seconds()
-            print(
-                f"Time taken for {model_name} - {file_shot_size} prompt - {instruction_size} instructions - {dataset_length} inferences: {get_elapsed_time(total_secs)}"
-            )
+                    output_file_path = f"{model_file_path}/predicted.txt"
+                    metrics_file_path = f"{model_file_path}/metrics.csv"
+                    print(f"Starting loop for {model_name} - {file_shot_size} prompt - {instruction_size} instructions - {dataset_length} inferences - resuming from {count}")
+                    loop_start_time = datetime.now()
+                    await run_queries_on_anyscale(
+                        query_list[count:],
+                        output_file_path,
+                        metrics_file_path,
+                        log_file_path,
+                        model_name,
+                        client,
+                        instruction_size,
+                        dataset_length,
+                        file_shot_size,
+                    )
+                    generate_gold_file(gold_file_list, model_file_path,dataset_length)
+                    loop_end_time = datetime.now()
+                    total_secs = (loop_end_time - loop_start_time).total_seconds()
+                    print(
+                        f"Time taken for {model_name} - {file_shot_size} prompt - {instruction_size} instructions - {dataset_length} inferences: {get_elapsed_time(total_secs)}"
+                    )
+
+            else:
+                output_file_path, metrics_file_path, log_file_path = initialize_files(
+                    model_file_path
+                )
+
+                print(
+                    f"Starting loop for {model_name} - {file_shot_size} prompt - {instruction_size} instructions - {dataset_length} inferences"
+                )
+                loop_start_time = datetime.now()
+                await run_queries_on_anyscale(
+                    query_list,
+                    output_file_path,
+                    metrics_file_path,
+                    log_file_path,
+                    model_name,
+                    client,
+                    instruction_size,
+                    dataset_length,
+                    file_shot_size,
+                )
+                generate_gold_file(gold_file_list, model_file_path,dataset_length)
+                loop_end_time = datetime.now()
+                total_secs = (loop_end_time - loop_start_time).total_seconds()
+                print(
+                    f"Time taken for {model_name} - {file_shot_size} prompt - {instruction_size} instructions - {dataset_length} inferences: {get_elapsed_time(total_secs)}"
+                )
 
 
 async def main() -> None:

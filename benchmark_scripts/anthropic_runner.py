@@ -3,9 +3,11 @@ import os
 import pathlib
 from openai import AsyncOpenAI
 import asyncio
+from anthropic import Anthropic
+
+
 from common_functions import (
     get_datasets_info,
-    initialize_system_prompt,
     initialize_files,
     generate_gold_file,
     write_to_file,
@@ -13,28 +15,30 @@ from common_functions import (
     get_elapsed_time,
     sql_match,
     get_parsed_args,
-    get_few_shot_sample_string,
+    get_instruction_shot_specific_prompt,
     multi_process_setup,
 )
 from typing import Tuple, List, Any
-from common_constants import Defaults, Environments, OpenAIModels
+from common_constants import Defaults, Environments, AnthropicModels
 
 CURRENT_FILE_PATH = pathlib.Path(__file__).parent.resolve()
 
 # Set environment variables
 exec(open(f"{CURRENT_FILE_PATH}/../set_env_vars.py").read())
-HOST_ENV = Environments.OPEN_AI
+HOST_ENV = Environments.ANTHROPIC
 
 # Get environment variables
-OPENAI_KEY = os.getenv("OPENAI_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
 
 supported_models = {
-    "gpt-4": OpenAIModels.MODEL_GPT_4,
-    "gpt-3": OpenAIModels.MODEL_GPT_3,
+    "cl3-op": AnthropicModels.MODEL_ANTHROPIC_OPUS,
+    "cl3-son": AnthropicModels.MODEL_ANTHROPIC_SONNET,
+    "cl3-hai": AnthropicModels.MODEL_ANTHROPIC_HAIKU
 }
 
 
-async def run_queries_on_open_ai(
+async def run_queries_on_anthropic(
     total_user_query: Tuple[str, str, str],
     output_file_path: str,
     metrics_file_path: str,
@@ -56,35 +60,36 @@ async def run_queries_on_open_ai(
                 "is_sql": 0,
             }
 
-            instructions_prompt = initialize_system_prompt(instruction_size)
-            system_prompt = get_few_shot_sample_string(
-                shot_size, db_id, instructions_prompt
+            system_prompt = get_instruction_shot_specific_prompt(
+                instruction_size, shot_size, db_id
             )
 
             req = [
+        {
+            "role": "user",
+            "content": [
                 {
-                    "role": "system",
-                    "content": system_prompt.replace("[context]", context).replace(
-                        "[question]", ""
-                    ).replace("[hint]",str(evidence)),
-                },
-                {
-                    "role": "user",
-                    "content": f"{question}",
-                },
+                    "type": "text",
+                    "text": system_prompt.replace("[context]", context).replace(
+                        "[question]", f"Question: {question}"
+                    ).replace("[hint]",str(evidence))
+                }
             ]
+        },
+    ]
             data_to_log["request"] = req
             response_time_start = datetime.now(timezone.utc)
-            open_ai_response = await client.chat.completions.create(
+            anthropic_response = client.messages.create(
                 model=model_name,
                 messages=req,
+                max_tokens=Defaults.MAX_TOKENS_TO_GENERATE,
             )
             response_time_stop = datetime.now(timezone.utc)
-            data_to_log["response"] = str(open_ai_response)
+            data_to_log["response"] = str(anthropic_response)
 
-            llm_response_content = open_ai_response.choices[0].message.content
-            llm_response_tokens = open_ai_response.usage.completion_tokens
-            llm_prompt_tokens = open_ai_response.usage.prompt_tokens
+            llm_response_content = anthropic_response.content[0].text
+            llm_response_tokens = anthropic_response.usage.output_tokens
+            llm_prompt_tokens = anthropic_response.usage.input_tokens
 
             if "select" in llm_response_content.lower():
                 is_sql_match, sql_response = sql_match(llm_response_content)
@@ -102,6 +107,7 @@ async def run_queries_on_open_ai(
                 )
                 continue
             
+
             data_to_log["response_time_start"] = response_time_start.strftime('%Y-%m-%d %H:%M:%S')
             data_to_log["response_time_stop"] = response_time_stop.strftime('%Y-%m-%d %H:%M:%S')
             data_to_log["is_sql"] = 1
@@ -134,7 +140,8 @@ async def multi_process(
     shot_size_list: List[str],
     target_dir: str,
 ) -> None:
-    client = AsyncOpenAI(api_key=OPENAI_KEY)
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
 
     for shot_size in shot_size_list:
         if "cot" in shot_size:
@@ -144,8 +151,6 @@ async def multi_process(
 
         for dataset_length, query_list, gold_file_list in datasets_info:
             model_file_path = f"{target_dir}/{HOST_ENV}/{file_shot_size}/{model_name}/{instruction_size}_Instructions/{dataset_length}_Inferences"
-
-            print(f"{model_file_path}/execution-log.jsonl")
             if os.path.exists(model_file_path) and os.path.isfile(f"{model_file_path}/execution-log.jsonl"):
                 count = 0
                 with open(f"{model_file_path}/execution-log.jsonl", 'r') as file:
@@ -162,7 +167,8 @@ async def multi_process(
                     metrics_file_path = f"{model_file_path}/metrics.csv"
                     print(f"Starting loop for {model_name} - {file_shot_size} prompt - {instruction_size} instructions - {dataset_length} inferences - resuming from {count}")
                     loop_start_time = datetime.now()
-                    await run_queries_on_open_ai(
+                    loop_start_time = datetime.now()
+                    await run_queries_on_anthropic(
                         query_list[count:],
                         output_file_path,
                         metrics_file_path,
@@ -179,8 +185,8 @@ async def multi_process(
                     print(
                         f"Time taken for {model_name} - {file_shot_size} prompt - {instruction_size} instructions - {dataset_length} inferences: {get_elapsed_time(total_secs)}"
                     )
-
             else:
+
                 output_file_path, metrics_file_path, log_file_path = initialize_files(
                     model_file_path
                 )
@@ -189,7 +195,7 @@ async def multi_process(
                     f"Starting loop for {model_name} - {file_shot_size} prompt - {instruction_size} instructions - {dataset_length} inferences"
                 )
                 loop_start_time = datetime.now()
-                await run_queries_on_open_ai(
+                await run_queries_on_anthropic(
                     query_list,
                     output_file_path,
                     metrics_file_path,
@@ -206,7 +212,6 @@ async def multi_process(
                 print(
                     f"Time taken for {model_name} - {file_shot_size} prompt - {instruction_size} instructions - {dataset_length} inferences: {get_elapsed_time(total_secs)}"
                 )
-
 
 
 async def main() -> None:
@@ -238,3 +243,5 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
